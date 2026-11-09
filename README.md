@@ -28,8 +28,8 @@ apt-get install -y wireguard-tools iproute2 qrencode
 ## Install
 
 ```bash
-install -m 755 wg-vps-manager /usr/local/sbin/wg-vps-manager
-ln -s /usr/local/sbin/wg-vps-manager /usr/local/bin/wgctl
+chmod +x install.sh
+./install.sh
 ```
 
 ## Usage
