@@ -28,6 +28,10 @@ if ! command -v ip >/dev/null 2>&1; then
   echo "未找到 ip。请先安装 iproute2。" >&2
   exit 1
 fi
+if ! command -v qrencode >/dev/null 2>&1; then
+  echo "警告：未找到 qrencode，show/qr 无法显示二维码。" >&2
+  echo "请安装：apt-get install qrencode" >&2
+fi
 
 install -d -m 755 "$PREFIX" "$BIN_DIR"
 install -m 755 "$SCRIPT_DIR/wgctl" "$PREFIX/wgctl"

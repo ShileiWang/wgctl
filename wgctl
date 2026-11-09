@@ -18,6 +18,9 @@ usage() {
   wgctl del 名称       删除本脚本创建的客户端
   wgctl help           显示帮助
 
+说明：本程序运行在 WireGuard 管理端（服务器），用于管理 Peer 并生成客户端配置。
+客户端请使用官方 WireGuard 应用导入配置文件或扫描二维码。
+
 选项：
   -i 接口              指定接口，默认 wgmesh
   -e 地址              指定服务端公网 IP 或域名
