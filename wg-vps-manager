@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# wgctl - lightweight additive WireGuard client manager
+# Never runs wg-quick down/up. Never removes unmanaged peers or other interfaces.
+set -Eeuo pipefail
+
+IFACE="wgmesh"
+ROOT="/etc/wireguard/clients"
+ENDPOINT=""
+ALLOWED=""
+
+usage() {
+  cat <<'EOF'
+用法：
+  wgctl add 名称       添加客户端并生成配置
+  wgctl ls             列出本脚本创建的客户端
+  wgctl show 名称      显示客户端配置
+  wgctl qr 名称        在终端显示客户端配置二维码
+  wgctl del 名称       删除本脚本创建的客户端
+  wgctl help           显示帮助
+
+选项：
+  -i 接口              指定接口，默认 wgmesh
+  -e 地址              指定服务端公网 IP 或域名
+  -n 网段              覆盖客户端 AllowedIPs，默认使用接口网段
+
+示例：
+  wgctl add ubuntu
+  wgctl show ubuntu
+  wgctl -i wg23 add laptop
+  wgctl -i wg155 add instabox
+EOF
+}
+
+fail() { echo "错误：$*" >&2; exit 1; }
+info() { echo "[wgctl] $*"; }
+root_only() { [ "$EUID" -eq 0 ] || fail "请使用 root 运行"; }
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+
+while getopts ":i:e:n:h" opt; do
+  case "$opt" in
+    i) IFACE="$OPTARG" ;;
+    e) ENDPOINT="$OPTARG" ;;
+    n) ALLOWED="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) fail "选项 -$OPTARG 缺少参数" ;;
+    \?) fail "未知选项 -$OPTARG" ;;
+  esac
+done
+shift $((OPTIND - 1))
+CMD="${1:-help}"
+NAME="${2:-}"
+
+check_iface() {
+  command -v wg >/dev/null 2>&1 || fail "未安装 wireguard-tools"
+  command -v ip >/dev/null 2>&1 || fail "未找到 ip 命令"
+  ip link show dev "$IFACE" >/dev/null 2>&1 || fail "接口不存在或未运行：$IFACE"
+  CONF="/etc/wireguard/$IFACE.conf"
+  [ -f "$CONF" ] || fail "找不到配置文件：$CONF"
+  mkdir -p "$ROOT/$IFACE"
+  chmod 700 "$ROOT" "$ROOT/$IFACE"
+
+  local cidr
+  cidr=""
+  while IFS= read -r cidr; do break; done < <(ip -4 -o addr show dev "$IFACE" | awk 'NR==1 {print $4}')
+  [ -n "$cidr" ] || fail "接口没有 IPv4 地址：$IFACE"
+
+  local info_file
+  info_file="$(mktemp)"
+  trap 'unlink "$info_file" 2>/dev/null || true' EXIT
+  python3 - "$cidr" > "$info_file" <<'PY'
+import ipaddress, sys
+net = ipaddress.ip_interface(sys.argv[1]).network
+print(net.network_address)
+print(net.prefixlen)
+print(net)
+PY
+  {
+    read -r NETWORK
+    read -r PREFIX
+    read -r IFACE_NETWORK
+  } < "$info_file"
+  unlink "$info_file"
+  trap - EXIT
+  [ "$PREFIX" -ge 24 ] || fail "接口网段小于 /24，拒绝自动分配：$IFACE_NETWORK"
+  [ -n "$ALLOWED" ] || ALLOWED="$IFACE_NETWORK"
+  LISTEN_PORT="$(wg show "$IFACE" listen-port)"
+  SERVER_IP="${NETWORK%.*}.1"
+  SERVER_PUBLIC_KEY="$(wg show "$IFACE" public-key)"
+  [ -n "$LISTEN_PORT" ] || fail "无法读取监听端口"
+  [ -n "$SERVER_PUBLIC_KEY" ] || fail "无法读取服务端公钥"
+}
+
+path_for() { printf '%s/%s/%s' "$ROOT" "$IFACE" "$1"; }
+
+next_ip() {
+  local n used candidate
+  for n in $(seq 2 254); do
+    candidate="${NETWORK%.*}.${n}/32"
+    used=0
+    if wg show "$IFACE" allowed-ips | grep -Eq "(^|[[:space:]])${candidate}([[:space:]]|$)"; then used=1; fi
+    if grep -RqsF "$candidate" "$ROOT/$IFACE" 2>/dev/null; then used=1; fi
+    if [ "$used" -eq 0 ]; then printf '%s\n' "$candidate"; return 0; fi
+  done
+  fail "$IFACE 的地址池已用尽：$IFACE_NETWORK"
+}
+
+add_client() {
+  valid_name "$NAME" || fail "名称只能包含字母、数字、点、下划线和短横线"
+  local dir private public addr backup block
+  dir="$(path_for "$NAME")"
+  [ ! -e "$dir" ] || fail "客户端已存在：$NAME"
+  addr="$(next_ip)"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  private="$(wg genkey)"
+  public="$(printf '%s' "$private" | wg pubkey)"
+  backup="${CONF}.bak-wgctl-$(date +%Y%m%d-%H%M%S)"
+  block="$dir/peer.block"
+  cp -p "$CONF" "$backup"
+  cat > "$block" <<EOF
+# WGCTL-BEGIN name=$NAME
+[Peer]
+# managed-by=wgctl name=$NAME
+PublicKey = $public
+AllowedIPs = $addr
+# WGCTL-END name=$NAME
+EOF
+  cat "$block" >> "$CONF"
+  if ! wg set "$IFACE" peer "$public" allowed-ips "$addr"; then
+    cp -p "$backup" "$CONF"
+    find "$dir" -maxdepth 1 -type f -exec unlink {} \; 2>/dev/null || true
+    rmdir "$dir" 2>/dev/null || true
+    fail "加载 Peer 失败，已恢复配置文件"
+  fi
+  cat > "$dir/client.conf" <<EOF
+[Interface]
+PrivateKey = $private
+Address = $addr
+
+[Peer]
+PublicKey = $SERVER_PUBLIC_KEY
+Endpoint = $ENDPOINT:$LISTEN_PORT
+AllowedIPs = $ALLOWED
+PersistentKeepalive = 25
+EOF
+  printf '%s\n' "$NAME" > "$dir/name"
+  printf '%s\n' "$public" > "$dir/public.key"
+  printf '%s\n' "$addr" > "$dir/address"
+  chmod 600 "$CONF" "$backup" "$block" "$dir/client.conf" "$dir/name" "$dir/public.key" "$dir/address"
+  if command -v qrencode >/dev/null 2>&1; then qrencode -o "$dir/client.png" < "$dir/client.conf"; chmod 600 "$dir/client.png"; fi
+  info "客户端已添加：$NAME"
+  info "接口：$IFACE，地址：$addr"
+  info "配置文件：$dir/client.conf"
+  info "备份文件：$backup"
+}
+
+list_clients() {
+  local base d
+  base="$ROOT/$IFACE"
+  printf '接口：%s\n' "$IFACE"
+  printf '%-24s %-18s %s\n' 名称 地址 状态
+  for d in "$base"/*; do
+    [ -d "$d" ] && [ -f "$d/name" ] || continue
+    local n a p state
+    n="$(cat "$d/name")"
+    a="$(cat "$d/address" 2>/dev/null || true)"
+    if [ -z "$a" ] && [ -f "$d/client.conf" ]; then
+      IFS= read -r a < <(awk -F " = " "/^Address/ {print \$2; exit}" "$d/client.conf")
+    fi
+    [ -n "$a" ] || a="未知"
+    p="$(cat "$d/public.key")"
+    state="正常"
+    wg show "$IFACE" peers | grep -Fxq "$p" || state="未加载"
+    printf '%-24s %-18s %s\n' "$n" "$a" "$state"
+  done
+}
+
+qr_client() {
+  valid_name "$NAME" || fail "名称无效"
+  command -v qrencode >/dev/null 2>&1 || fail "未安装 qrencode，请先安装：apt-get install qrencode"
+  local dir
+  dir="/etc/wireguard/clients/$IFACE/$NAME"
+  [ -f "$dir/client.conf" ] || fail "找不到客户端：$NAME"
+  qrencode -t ANSIUTF8 -m 1 < "$dir/client.conf"
+}
+
+show_client() {
+  valid_name "$NAME" || fail "名称无效"
+  local dir
+  dir="$(path_for "$NAME")"
+  [ -f "$dir/client.conf" ] || fail "找不到客户端：$NAME"
+  cat "$dir/client.conf"
+  printf "\n--- QR Code ---\n"
+  qr_client
+}
+
+delete_client() {
+  valid_name "$NAME" || fail "名称无效"
+  local dir public backup
+  dir="$(path_for "$NAME")"
+  [ -f "$dir/public.key" ] || fail "该客户端不是本脚本创建的，拒绝删除"
+  public="$(cat "$dir/public.key")"
+  wg show "$IFACE" peers | grep -Fxq "$public" || fail "运行中找不到该 Peer，拒绝删除"
+  grep -Fqx "# WGCTL-BEGIN name=$NAME" "$CONF" || fail "配置标记缺失，未作任何修改"
+  grep -Fqx "# WGCTL-END name=$NAME" "$CONF" || fail "配置标记不完整，未作任何修改"
+  backup="${CONF}.bak-wgctl-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$CONF" "$backup"
+  wg set "$IFACE" peer "$public" remove
+  awk -v begin="# WGCTL-BEGIN name=$NAME" -v end="# WGCTL-END name=$NAME" '$0==begin {skip=1} !skip {print} $0==end {skip=0}' "$CONF" > "$CONF.tmp"
+  install -m 600 "$CONF.tmp" "$CONF"
+  unlink "$CONF.tmp"
+  find "$dir" -maxdepth 1 -type f -exec unlink {} \; 2>/dev/null || true
+  rmdir "$dir" 2>/dev/null || true
+  info "客户端已删除：$NAME"
+  info "原有客户端和配置文件未删除"
+  info "备份文件：$backup"
+}
+
+root_only
+check_iface
+case "$CMD" in
+  add) [ -n "$NAME" ] || fail "请指定名称，例如：wgctl add ubuntu"; add_client ;;
+  ls|list) list_clients ;;
+  show|print) [ -n "$NAME" ] || fail "请指定名称，例如：wgctl show ubuntu"; show_client ;;
+  qr|qrcode) [ -n "$NAME" ] || fail "请指定名称，例如：wgctl qr ubuntu"; qr_client ;;
+  del|delete|remove) [ -n "$NAME" ] || fail "请指定名称，例如：wgctl del ubuntu"; delete_client ;;
+  help|-h) usage ;;
+  *) fail "未知命令：$CMD；运行 wgctl help 查看用法" ;;
+esac
